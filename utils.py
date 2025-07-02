@@ -1,45 +1,51 @@
 import os
+import lime
+import torch
+import shap
+import torch
 import pandas as pd
 import numpy as np
-import torch
-from torch.utils.data import Dataset
 import torch.nn as nn
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (
-    confusion_matrix, ConfusionMatrixDisplay, classification_report,
-    roc_curve, auc, roc_auc_score, accuracy_score, f1_score
-)
-from sklearn.preprocessing import label_binarize
-import matplotlib.pyplot as plt
+import streamlit.components.v1 as components
 from lime.lime_tabular import LimeTabularExplainer
-import shap 
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder,label_binarize
+from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, 
+                             precision_recall_curve, average_precision_score,precision_recall_fscore_support)
 
 
-# ======================
-# 1D CNN Model
-# ======================
-class CNN1D(nn.Module):
-    def __init__(self, input_length, num_classes):
-        super(CNN1D, self).__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveMaxPool1d(1),
-            nn.Flatten(),
-            nn.Linear(32, num_classes)
-        )
+# ============================
+# 1. Data Preprocessing
+# ============================
 
-    def forward(self, x):
-        return self.net(x)
+def clean_and_save_drug_csv(drug_files: dict, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
+    for drug, config in drug_files.items():
+        df = pd.read_csv(config["path"])
+        df_cleaned = df.drop(index=2).reset_index(drop=True)
+        header_residues = df_cleaned.iloc[0]
+        header_types = df_cleaned.iloc[1]
+        multi_index = pd.MultiIndex.from_arrays([header_residues, header_types])
+        df_cleaned = df_cleaned.drop(index=[0, 1]).reset_index(drop=True)
+        df_cleaned.columns = multi_index
+        frame_col = df.iloc[3:, 0].reset_index(drop=True)
+        df_cleaned.insert(0, ("meta", "frame"), frame_col.astype(int))
+        if ("protein", "interaction") in df_cleaned.columns:
+            df_cleaned = df_cleaned.drop(columns=[("protein", "interaction")])
+        df_cleaned = df_cleaned.apply(pd.to_numeric, errors='ignore').fillna(0)
+        df_cleaned[("meta", "bond_type")] = config["bond_type"]
+        df_cleaned[("meta", "drug_name")] = config["drug_name"]
+        df_cleaned = df_cleaned[
+            [col for col in df_cleaned.columns if col[0] != "meta" or col[1] == "frame"]
+            + [("meta", "bond_type"), ("meta", "drug_name")]
+        ]
+        output_path = os.path.join(output_dir, f"cleaned_{config['drug_name']}.csv")
+        df_cleaned.to_csv(output_path, index=False)
+        print(f"✅ Saved cleaned CSV for {drug} at {output_path}")
 
 
-# ======================
-# PyTorch Dataset Class
-# ======================
 class FingerprintDataset(Dataset):
     def __init__(self, X, y):
         self.X = torch.tensor(X, dtype=torch.float32)
@@ -52,319 +58,167 @@ class FingerprintDataset(Dataset):
         return self.X[idx].unsqueeze(0), self.y[idx]
 
 
-# =======================
-# Data Cleaning Function
-# =======================
-def clean_and_save_drug_csv(drug_files: dict, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-    for drug, config in drug_files.items():
-        df = pd.read_csv(config["path"])
+# ============================
+# 2. ResNet1D Model
+# ============================
+class ResidualBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super(ResidualBlock1D, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=1)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.downsample = nn.Sequential()
+        if in_channels != out_channels:
+            self.downsample = nn.Conv1d(in_channels, out_channels, 1)
 
-        # Step 1: Drop third row
-        df_cleaned = df.drop(index=2).reset_index(drop=True)
-
-        # Step 2–3: MultiIndex creation
-        header_residues = df_cleaned.iloc[0]
-        header_types = df_cleaned.iloc[1]
-        multi_index = pd.MultiIndex.from_arrays([header_residues, header_types])
-
-        # Step 4–5: Clean header rows
-        df_cleaned = df_cleaned.drop(index=[0, 1]).reset_index(drop=True)
-        df_cleaned.columns = multi_index
-
-        # Step 6: Insert frame column
-        frame_col = df.iloc[3:, 0].reset_index(drop=True)
-        df_cleaned.insert(0, ("meta", "frame"), frame_col.astype(int))
-
-        # Step 6.5: Drop redundant column
-        if ("protein", "interaction") in df_cleaned.columns:
-            df_cleaned = df_cleaned.drop(columns=[("protein", "interaction")])
-
-        # Step 7–8: Convert numerics and fill NaNs
-        df_cleaned = df_cleaned.apply(pd.to_numeric, errors='ignore').fillna(0)
-
-        # Step 9: Add meta columns
-        df_cleaned[("meta", "bond_type")] = config["bond_type"]
-        df_cleaned[("meta", "drug_name")] = config["drug_name"]
-
-        # Step 10: Reorder columns
-        df_cleaned = df_cleaned[
-            [col for col in df_cleaned.columns if col[0] != "meta" or col[1] == "frame"]
-            + [("meta", "bond_type"), ("meta", "drug_name")]
-        ]
-
-        # Save to CSV
-        output_path = os.path.join(output_dir, f"cleaned_{config['drug_name']}.csv")
-        df_cleaned.to_csv(output_path, index=False)
-        print(f"Saved cleaned CSV for {drug}: {output_path}")
+    def forward(self, x):
+        identity = self.downsample(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + identity)
 
 
-# ===================================
-# NumPy Feature + Label Preparation
-# ===================================
-def prepare_numpy_data(drug_names: list, input_dir: str, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-    X_list = []
-    y_list = []
+class ResNet1D(nn.Module):
+    def __init__(self, input_channels, num_classes):
+        super(ResNet1D, self).__init__()
+        self.layer1 = ResidualBlock1D(input_channels, 32)
+        self.layer2 = ResidualBlock1D(32, 64)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(64, num_classes)
 
-    for drug in drug_names:
-        df = pd.read_csv(os.path.join(input_dir, f"cleaned_{drug}.csv"), header=[0, 1])
-        X = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
-        y = df[("meta", "bond_type")]
-        X_list.append(X)
-        y_list.append(y)
-
-    X_all = np.vstack(X_list)
-    y_all_series = pd.concat(y_list)
-
-    le = LabelEncoder()
-    y_all = le.fit_transform(y_all_series)
-
-    np.save(os.path.join(output_dir, "X_all.npy"), X_all)
-    np.save(os.path.join(output_dir, "y_all.npy"), y_all)
-    np.save(os.path.join(output_dir, "y_labels.npy"), le.classes_)
-
-    print(f"Saved NumPy arrays to: {output_dir}")
-    return X_all, y_all, le.classes_
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.pool(x)
+        x = self.flatten(x)
+        return self.fc(x)
 
 
-
-# ======================
-# Training Loop
-# ======================
-def train_model(model, train_loader, device, epochs=50, lr=0.001):
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model.to(device)
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss:.4f}")
-
-
-# ======================
-# Evaluation
-# ======================
-def evaluate_model(model, test_loader, device):
-    model.eval()
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch = X_batch.to(device)
-            outputs = model(X_batch)
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(y_batch.numpy())
-
-    return np.array(all_labels), np.array(all_preds)
-
-
-# ======================
-# Save Model
-# ======================
-def save_model(model, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(model.state_dict(), path)
-    print(f"Model weights saved to: {path}")
-
-
-# ======================
-# Diagnostic Plots
-# ======================
-def plot_classification_metrics(y_true, y_pred, labels):
-
-    from collections import Counter
-
-    # ==============================
-    # 1. Prediction Counts per Class
-    # ==============================
-    print("\nTotal Predictions Per Class:")
-    pred_counter = Counter(y_pred)
-    for class_index, count in pred_counter.items():
-        print(f"{labels[class_index]}: {count} frames")
-
-    
-    # ==============================
-    # 2. Confusion Matrix
-    # ==============================
-    cm = confusion_matrix(y_true, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
-    fig, ax = plt.subplots(figsize=(6, 6))
-    disp.plot(ax=ax, cmap="Blues", colorbar=False)
-    plt.title("Confusion Matrix")
-    plt.show()
-
-    # ==============================
-    # 3. Classification Report
-    # ==============================
-    print("Classification Report:")
-    print(classification_report(y_true, y_pred, target_names=labels))
-
-    # ==============================
-    # 4. Basic Summary Metrics
-    # ==============================
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, average="weighted")
-    print(f"\nAccuracy: {acc:.4f}")
-    print(f"Weighted F1 Score: {f1:.4f}")
-
-    # ==============================
-    # 5. ROC Curve (for binary or multi-class)
-    # ==============================
-    y_true_bin = label_binarize(y_true, classes=np.arange(len(labels)))
-    y_pred_bin = label_binarize(y_pred, classes=np.arange(len(labels)))
-
-    if y_true_bin.shape[1] == 1:
-        y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
-        y_pred_bin = np.hstack([1 - y_pred_bin, y_pred_bin])
-
-    fpr = dict()
-    tpr = dict()
-    roc_auc = dict()
-    for i in range(y_true_bin.shape[1]):
-        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_pred_bin[:, i])
-        roc_auc[i] = auc(fpr[i], tpr[i])
-
-    plt.figure(figsize=(8, 6))
-    for i, label in enumerate(labels):
-        plt.plot(fpr[i], tpr[i], label=f"{label} (AUC = {roc_auc[i]:.2f})")
-    plt.plot([0, 1], [0, 1], "k--")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curves")
-    plt.legend(loc="lower right")
-    plt.grid(True)
-    plt.show()
-
-
-# ======================
-# Prediction on unseen data
-# ======================
+# ============================
+# 3. Model Evaluation
+# ============================
 def evaluate_on_new_csv(csv_path, model_path, y_labels, device):
     import torch
     from torch.utils.data import DataLoader
+    import torch.nn.functional as F
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
 
     # Load cleaned CSV
     df = pd.read_csv(csv_path, header=[0, 1])
-
-    # Extract features
     X = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
     y = df[("meta", "bond_type")].values
 
     # Encode labels
     le = LabelEncoder()
-    le.fit(y_labels)  # Use label space from training
+    le.fit(y_labels)
     y_encoded = le.transform(y)
 
-    # Dataset + Dataloader
     dataset = FingerprintDataset(X, y_encoded)
     loader = DataLoader(dataset, batch_size=32)
 
-    # Load model
-    model = CNN1D(input_length=X.shape[1], num_classes=len(y_labels))
+    model = ResNet1D(input_channels=1, num_classes=len(y_labels))
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
 
-    # Predict
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
 
     with torch.no_grad():
         for X_batch, y_batch in loader:
             X_batch = X_batch.to(device)
             outputs = model(X_batch)
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
+            probs = F.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(y_batch.numpy())
 
-    # Show metrics
-    plot_classification_metrics(np.array(all_labels), np.array(all_preds), y_labels)
+    acc = accuracy_score(all_labels, all_preds)
+    print(f"\n✅ Accuracy: {acc:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(all_labels, all_preds, target_names=y_labels))
+
+    # Confusion matrix figure
+    cm = confusion_matrix(all_labels, all_preds)
+    fig_cm, ax_cm = plt.subplots(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=y_labels)
+    disp.plot(ax=ax_cm, cmap="Blues", colorbar=False)
+    ax_cm.set_title("Confusion Matrix")
+
+    result_df = pd.DataFrame({
+        "True Label": [y_labels[i] for i in all_labels],
+        "Predicted": [y_labels[i] for i in all_preds]
+    })
+    print("\nSample Predictions:")
+    print(result_df.head(10))
+
+    return result_df, fig_cm
 
 
-# ======================
-# LIME function 
-# ======================
-def explain_prediction_with_lime(model, dataset, index, y_labels, feature_names, device):
+# ============================
+# 4. LIME
+# ============================
+def explain_with_lime(model, X_test, y_labels, feature_names, device, frame_index=20):
     model.eval()
+    explainer = LimeTabularExplainer(
+        training_data=X_test,
+        mode="classification",
+        class_names=y_labels.tolist(),
+        feature_names=feature_names,
+        discretize_continuous=False
+    )
 
-    X_sample, y_sample = dataset[index]
-    X_np = X_sample.squeeze(0).numpy()  # shape: (features,)
-
-    # Define prediction function for LIME
-    def predict_fn(inputs):
+    def predict_fn_lime(inputs):
         inputs_tensor = torch.tensor(inputs[:, np.newaxis, :], dtype=torch.float32).to(device)
         outputs = model(inputs_tensor)
         probs = F.softmax(outputs, dim=1).detach().cpu().numpy()
         return probs
 
-
-    # Setup LIME
-    explainer = LimeTabularExplainer(
-        training_data=np.array([sample[0].squeeze(0).numpy() for sample in dataset]),
-        mode="classification",
-        class_names=y_labels,
-        feature_names=feature_names,
-        discretize_continuous=False
-    )
-
-
-    # Explain one instance
     explanation = explainer.explain_instance(
-        data_row=X_np,
-        predict_fn=predict_fn,
-       num_features=12,
+        data_row=X_test[frame_index],
+        predict_fn=predict_fn_lime,
+        num_features=12,
         top_labels=1
     )
+    # Return the explanation HTML (to embed in Streamlit)
+    return explanation.as_html(show_table=True)
 
-    explanation.show_in_notebook(show_table=True)
-    explanation.save_to_file("lime_explanation.html")
-
-
-# ======================
-# SHAP function 
-# ======================
-def explain_prediction_shap_deep(model, X_train, X_mdma, real_feature_names, frame_index, device):
+# ============================
+# 5. SHAP
+# ============================
+def explain_with_shap(model, X_test, y_labels, feature_names, device, frame_index=20):
     model.eval()
+    background = torch.tensor(X_test[:200]).unsqueeze(1).float().to(device)
+    test_sample = torch.tensor(X_test[frame_index:frame_index+1]).unsqueeze(1).float().to(device)
 
-    # Convert background and sample to tensors
-    background = torch.tensor(X_train[:200]).unsqueeze(1).float().to(device)  # shape: (N, 1, features)
-    mdma_tensor = torch.tensor(X_mdma).unsqueeze(1).float().to(device)
-
-    # Create DeepExplainer
     explainer = shap.DeepExplainer(model, background)
 
-    # Predict and get SHAP values for selected frame
-    i = frame_index
-    shap_values = explainer.shap_values(mdma_tensor[i:i+1], check_additivity=False)
+    with torch.no_grad():
+        output = model(test_sample)
+        probs = torch.softmax(output, dim=1).cpu().numpy()[0]
+        pred_class = np.argmax(probs)
+        pred_label = y_labels[pred_class]
+        confidence = probs[pred_class]
 
-    # Get predicted class
-    pred_class = torch.argmax(model(mdma_tensor[i:i+1])).item()
+    shap_values = explainer.shap_values(test_sample, check_additivity=False)
+    shap_vector = shap_values[0][0, :, pred_class]
+    base_value = explainer.expected_value[pred_class]
 
-    # Extract SHAP vector for that class
-    shap_vector = shap_values[pred_class][0]
-    if shap_vector.ndim == 2:
-        shap_vector = shap_vector[:, pred_class]
-
-    # Create SHAP Explanation object
-    explanation_obj = shap.Explanation(
+    explanation = shap.Explanation(
         values=shap_vector,
-        base_values=explainer.expected_value[pred_class],
-        data=X_mdma[i],
-        feature_names=real_feature_names
+        base_values=base_value,
+        data=X_test[frame_index],
+        feature_names=feature_names
     )
 
-    # Plot waterfall chart
-    shap.plots.waterfall(explanation_obj)
-
+    # Plot to a matplotlib figure and return it
+    fig = plt.figure(figsize=(10,6))
+    shap.plots.waterfall(explanation, max_display=20, show=False)
+    plt.tight_layout()
+    return fig, pred_label, confidence
