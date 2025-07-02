@@ -1,19 +1,24 @@
+# ========================
+# 🚀 Imports and Setup
+# ========================
 import streamlit as st
 import os
 import pandas as pd
 import torch
 import numpy as np
 import streamlit.components.v1 as components
+import torch.nn.functional as F
 
 from utils import (
     FingerprintDataset,
-    ResNet1D,
-    clean_and_save_drug_csv,
+    ExpandedResNet1D,
+    preprocess_input_csv,
     evaluate_on_new_csv,
     explain_with_lime,
     explain_with_shap
 )
 
+# Setup Streamlit and paths
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 test_save_dir = "Data/Test"
 os.makedirs(test_save_dir, exist_ok=True)
@@ -21,10 +26,36 @@ os.makedirs(test_save_dir, exist_ok=True)
 st.set_page_config(page_title="DAT Classifier", layout="centered")
 st.title("🧬 DAT Bond Type Classifier")
 
-uploaded_file = st.file_uploader("📂 Upload a cleaned or raw CSV file", type=["csv"])
+# ========================
+# ⚙️ Caching for Performance
+# ========================
 
-def highlight_wrong_preds(row):
-    return ['background-color: #ffcccc' if row['True Label'] != row['Predicted'] else '' for _ in row]
+@st.cache_resource(show_spinner=False)
+def get_lime_explainer(X_train, y_labels, feature_names):
+    from lime.lime_tabular import LimeTabularExplainer
+    return LimeTabularExplainer(
+        training_data=X_train,
+        mode="classification",
+        class_names=y_labels.tolist(),
+        feature_names=feature_names,
+        discretize_continuous=False
+    )
+
+@st.cache_data(show_spinner=False)
+def cached_predict_fn(_model_state_dict, input_channels, num_classes, device, inputs):
+    model = ExpandedResNet1D(input_channels=input_channels, num_classes=num_classes)
+    model.load_state_dict(_model_state_dict)
+    model.to(device)
+    model.eval()
+    inputs_tensor = torch.tensor(inputs[:, np.newaxis, :], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        outputs = model(inputs_tensor)
+        return F.softmax(outputs, dim=1).cpu().numpy()
+
+# ========================
+# 📂 File Upload and Cleaning
+# ========================
+uploaded_file = st.file_uploader("📂 Upload a cleaned or raw CSV file", type=["csv"])
 
 if uploaded_file:
     file_name = uploaded_file.name
@@ -36,40 +67,33 @@ if uploaded_file:
 
     try:
         df = pd.read_csv(raw_path, header=[0, 1])
-        if ("meta", "bond_type") in df.columns and ("meta", "drug_name") in df.columns:
-            st.success("✅ Cleaned format detected.")
+        if ("meta", "frame") in df.columns:
+            st.success("✅ Data appears cleaned or processed (meta frame column found).")
             cleaned_path = raw_path
         else:
-            raise Exception("Missing required meta columns")
+            raise Exception("Missing required 'meta' frame column")
     except Exception:
-        st.warning("⚠️ Raw file detected. Please clean it first.")
+        st.warning("⚠️ Raw or improperly formatted file detected. Please clean it first.")
         cleaned_path = None
 
     if cleaned_path is None and st.button("🧼 Clean Uploaded File"):
-        guessed_name = os.path.splitext(file_name)[0]
-        config = {
-            guessed_name: {
-                "path": raw_path,
-                "bond_type": "unknown",
-                "drug_name": guessed_name
-            }
-        }
-        clean_and_save_drug_csv(config, test_save_dir)
-        cleaned_path = os.path.join(test_save_dir, f"cleaned_{guessed_name}.csv")
+        cleaned_path = preprocess_input_csv(raw_path, test_save_dir)
         df = pd.read_csv(cleaned_path, header=[0, 1])
-        st.success("*File cleaned and saved.")
+        st.success("🧹 File cleaned and saved.")
         st.write("Preview of cleaned data:", df.head())
 
+    # Track state
     if "results" not in st.session_state:
         st.session_state["results"] = None
-    if "fig_cm" not in st.session_state:
-        st.session_state["fig_cm"] = None
 
+    # ========================
+    # 🧠 Model Selection and Prediction
+    # ========================
     if cleaned_path:
         st.markdown("---")
         st.subheader("Choose a Model")
         model_options = {
-            "ResNet1D (default)": "models/transfer/resnet1d_model.pt"
+            "ExpandedResNet1D (v2)": "models/v2/v2_model.pt"
         }
         model_choice = st.selectbox("Available Models", list(model_options.keys()))
         model_path = model_options[model_choice]
@@ -82,60 +106,65 @@ if uploaded_file:
                 st.error("❌ y_labels.npy not found in 'models/transfer'")
             else:
                 st.info("Predicting on uploaded data...")
-                results, fig_cm = evaluate_on_new_csv(cleaned_path, model_path, y_labels, device)
-                st.session_state["results"] = results
-                st.session_state["fig_cm"] = fig_cm
-                st.session_state["y_labels"] = y_labels
-                st.session_state["model_path"] = model_path
-                st.session_state["cleaned_path"] = cleaned_path
+
+                results, _ = evaluate_on_new_csv(
+                    cleaned_path,
+                    model_path,
+                    y_labels,
+                    device,
+                    model_class=ExpandedResNet1D
+                )
+                st.session_state.update({
+                    "results": results,
+                    "y_labels": y_labels,
+                    "model_path": model_path,
+                    "cleaned_path": cleaned_path
+                })
                 st.success("✅ Prediction Complete")
 
+        # ========================
+        #  Display Predictions and Stats
+        # ========================
         if st.session_state["results"] is not None:
             st.subheader("📊 Sample Predictions")
-            styled_df = st.session_state["results"].style.apply(highlight_wrong_preds, axis=1)
+
+            sample_df = st.session_state["results"][["Predicted"]].copy()
+            color_map = {
+                "occluded": "color: #f9a825",
+                "outward": "color: #d32f2f",
+                "inward": "color: #388e3c"
+            }
+            styled_df = sample_df.style.applymap(lambda val: color_map.get(val, ""))
             st.dataframe(styled_df, height=400)
 
-            # New Overall Stats section
             st.subheader("📈 Overall Stats")
             counts = st.session_state["results"]["Predicted"].value_counts()
             for label in st.session_state["y_labels"]:
-                count = counts.get(label, 0)
-                st.write(f"{label}: {count} frames")
+                st.write(f"{label}: {counts.get(label, 0)} frames")
 
-            st.subheader("📊 Confusion Matrix")
-            st.pyplot(st.session_state["fig_cm"])
+            # ========================
+            #  Explanation Method Selection
+            # ========================
+            explanation_method = st.selectbox("🧪 Choose Explanation Method", options=["None", "LIME", "SHAP", "Aggregate LIME"])
+            df = pd.read_csv(st.session_state["cleaned_path"], header=[0, 1])
+            X_test = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
+            feature_names = [f"{res}-{inter}" for res, inter in df.columns if res != "meta"]
 
-            explanation_method = st.selectbox("🧪 Choose Explanation Method", options=["None", "LIME", "SHAP"])
+            if explanation_method in ["LIME", "SHAP"]:
+                frame_index = st.number_input("Select Frame Number for Explanation", 0, len(X_test)-1, 20)
 
-            if explanation_method != "None":
-                max_frame = len(st.session_state["results"])
-                frame_index = st.number_input(
-                    label="Select Frame Number for Explanation",
-                    min_value=0,
-                    max_value=max_frame - 1,
-                    value=20,
-                    step=1
-                )
-
+            # ========================
+            #  Single-Frame LIME Explanation
+            # ========================
             if explanation_method == "LIME":
                 st.info(f"Running LIME explanation for frame {frame_index}...")
 
-                y_labels = st.session_state.get("y_labels")
-                if y_labels is None:
-                    y_labels = np.load("models/transfer/y_labels.npy", allow_pickle=True)
-                model_path = st.session_state.get("model_path")
-                cleaned_path = st.session_state.get("cleaned_path")
-
-                model = ResNet1D(input_channels=1, num_classes=len(y_labels))
-                model.load_state_dict(torch.load(model_path, map_location=device))
+                model = ExpandedResNet1D(input_channels=1, num_classes=len(st.session_state["y_labels"]))
+                model.load_state_dict(torch.load(st.session_state["model_path"], map_location=device))
                 model.to(device)
                 model.eval()
 
-                df = pd.read_csv(cleaned_path, header=[0, 1])
-                X_test = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
-                feature_names = [f"{res}-{inter}" for res, inter in df.columns if res != "meta"]
-
-                lime_html = explain_with_lime(model, X_test, y_labels, feature_names, device, frame_index=frame_index)
+                lime_html = explain_with_lime(model, X_test, st.session_state["y_labels"], feature_names, device, frame_index=frame_index)
 
                 wrapped_html = f"""
                 <div style="background-color: white; padding: 15px; border-radius: 8px;">
@@ -143,27 +172,73 @@ if uploaded_file:
                     {lime_html}
                 </div>
                 """
-
                 components.html(wrapped_html, height=1000)
 
+            # ========================
+            #  Single-Frame SHAP Explanation
+            # ========================
             elif explanation_method == "SHAP":
                 st.info(f"Running SHAP explanation for frame {frame_index}...")
 
-                y_labels = st.session_state.get("y_labels")
-                if y_labels is None:
-                    y_labels = np.load("models/transfer/y_labels.npy", allow_pickle=True)
-                model_path = st.session_state.get("model_path")
-                cleaned_path = st.session_state.get("cleaned_path")
-
-                model = ResNet1D(input_channels=1, num_classes=len(y_labels))
-                model.load_state_dict(torch.load(model_path, map_location=device))
+                model = ExpandedResNet1D(input_channels=1, num_classes=len(st.session_state["y_labels"]))
+                model.load_state_dict(torch.load(st.session_state["model_path"], map_location=device))
                 model.to(device)
                 model.eval()
 
-                df = pd.read_csv(cleaned_path, header=[0, 1])
-                X_test = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
-                feature_names = [f"{res}-{inter}" for res, inter in df.columns if res != "meta"]
-
-                fig, pred_label, confidence = explain_with_shap(model, X_test, y_labels, feature_names, device, frame_index=frame_index)
+                fig, pred_label, confidence = explain_with_shap(
+                    model, X_test, st.session_state["y_labels"], feature_names, device, frame_index=frame_index
+                )
                 st.write(f"Frame {frame_index} Prediction: **{pred_label.upper()}** (Confidence: {confidence:.2f})")
                 st.pyplot(fig)
+
+            # ========================
+            #  Class-Specific Aggregate LIME Explanation
+            # ========================
+            elif explanation_method == "Aggregate LIME":
+                st.info("Computing class-specific aggregate LIME explanation...")
+
+                selected_class = st.selectbox("Select Class for Aggregation", options=st.session_state["y_labels"])
+                num_frames = st.number_input("Number of Frames to Aggregate", 10, min(200, len(X_test)), 50, step=10)
+
+                model_state_dict = torch.load(st.session_state["model_path"], map_location=device)
+
+                def predict_fn_lime(inputs):
+                    return cached_predict_fn(
+                        _model_state_dict=model_state_dict,
+                        input_channels=1,
+                        num_classes=len(st.session_state["y_labels"]),
+                        device=device,
+                        inputs=inputs
+                    )
+
+                explainer = get_lime_explainer(X_test, st.session_state["y_labels"], feature_names)
+
+                importance, matched = {}, 0
+                for i in range(len(X_test)):
+                    if matched >= num_frames:
+                        break
+                    if st.session_state["results"].iloc[i]["Predicted"] != selected_class:
+                        continue
+                    matched += 1
+                    explanation = explainer.explain_instance(
+                        data_row=X_test[i],
+                        predict_fn=predict_fn_lime,
+                        num_features=20,
+                        top_labels=1,
+                        num_samples=500
+                    )
+                    top_label_index = explanation.available_labels()[0]
+                    for feat, weight in explanation.as_list(label=top_label_index):
+                        importance[feat] = importance.get(feat, 0) + abs(weight)
+
+                if matched == 0:
+                    st.warning(f"No frames found with predicted class '{selected_class}'.")
+                else:
+                    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]
+                    import matplotlib.pyplot as plt
+                    feat_names, weights = zip(*sorted_importance)
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    ax.barh(feat_names[::-1], weights[::-1], color='darkorange')
+                    ax.set_xlabel(f"Aggregate LIME Importance for '{selected_class}'")
+                    ax.set_title(f"Top Features Across {matched} '{selected_class}' Frames")
+                    st.pyplot(fig)
