@@ -57,7 +57,7 @@ if uploaded_file:
         clean_and_save_drug_csv(config, test_save_dir)
         cleaned_path = os.path.join(test_save_dir, f"cleaned_{guessed_name}.csv")
         df = pd.read_csv(cleaned_path, header=[0, 1])
-        st.success("🧹 File cleaned and saved.")
+        st.success("*File cleaned and saved.")
         st.write("Preview of cleaned data:", df.head())
 
     if "results" not in st.session_state:
@@ -67,7 +67,7 @@ if uploaded_file:
 
     if cleaned_path:
         st.markdown("---")
-        st.subheader("🧠 Choose a Model")
+        st.subheader("Choose a Model")
         model_options = {
             "ResNet1D (default)": "models/transfer/resnet1d_model.pt"
         }
@@ -91,18 +91,34 @@ if uploaded_file:
                 st.success("✅ Prediction Complete")
 
         if st.session_state["results"] is not None:
-            st.subheader("📊 Sample Predictions (Scrollable)")
+            st.subheader("📊 Sample Predictions")
             styled_df = st.session_state["results"].style.apply(highlight_wrong_preds, axis=1)
             st.dataframe(styled_df, height=400)
+
+            # New Overall Stats section
+            st.subheader("📈 Overall Stats")
+            counts = st.session_state["results"]["Predicted"].value_counts()
+            for label in st.session_state["y_labels"]:
+                count = counts.get(label, 0)
+                st.write(f"{label}: {count} frames")
 
             st.subheader("📊 Confusion Matrix")
             st.pyplot(st.session_state["fig_cm"])
 
-            # Single selectbox for explanation method
             explanation_method = st.selectbox("🧪 Choose Explanation Method", options=["None", "LIME", "SHAP"])
 
+            if explanation_method != "None":
+                max_frame = len(st.session_state["results"])
+                frame_index = st.number_input(
+                    label="Select Frame Number for Explanation",
+                    min_value=0,
+                    max_value=max_frame - 1,
+                    value=20,
+                    step=1
+                )
+
             if explanation_method == "LIME":
-                st.info("Running LIME explanation...")
+                st.info(f"Running LIME explanation for frame {frame_index}...")
 
                 y_labels = st.session_state.get("y_labels")
                 if y_labels is None:
@@ -119,16 +135,19 @@ if uploaded_file:
                 X_test = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
                 feature_names = [f"{res}-{inter}" for res, inter in df.columns if res != "meta"]
 
-                lime_html = explain_with_lime(model, X_test, y_labels, feature_names, device, frame_index=20)
+                lime_html = explain_with_lime(model, X_test, y_labels, feature_names, device, frame_index=frame_index)
 
-                # Replace default LIME colors: orange->red, green->bright green
-                lime_html = lime_html.replace("#ff7f0e", "#d62728")  # orange -> red
-                lime_html = lime_html.replace("#2ca02c", "#2ecc40")  # green -> bright green
+                wrapped_html = f"""
+                <div style="background-color: white; padding: 15px; border-radius: 8px;">
+                    <h3>Frame {frame_index} Explanation</h3>
+                    {lime_html}
+                </div>
+                """
 
-                components.html(lime_html, height=800)
+                components.html(wrapped_html, height=1000)
 
             elif explanation_method == "SHAP":
-                st.info("Running SHAP explanation...")
+                st.info(f"Running SHAP explanation for frame {frame_index}...")
 
                 y_labels = st.session_state.get("y_labels")
                 if y_labels is None:
@@ -145,6 +164,6 @@ if uploaded_file:
                 X_test = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
                 feature_names = [f"{res}-{inter}" for res, inter in df.columns if res != "meta"]
 
-                fig, pred_label, confidence = explain_with_shap(model, X_test, y_labels, feature_names, device, frame_index=20)
-                st.write(f"Prediction for frame 20: **{pred_label.upper()}** (Confidence: {confidence:.2f})")
+                fig, pred_label, confidence = explain_with_shap(model, X_test, y_labels, feature_names, device, frame_index=frame_index)
+                st.write(f"Frame {frame_index} Prediction: **{pred_label.upper()}** (Confidence: {confidence:.2f})")
                 st.pyplot(fig)

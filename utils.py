@@ -12,14 +12,12 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import LabelEncoder,label_binarize
-from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay, 
-                             precision_recall_curve, average_precision_score,precision_recall_fscore_support)
+from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay)
 
 
 # ============================
 # 1. Data Preprocessing
 # ============================
-
 def clean_and_save_drug_csv(drug_files: dict, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     for drug, config in drug_files.items():
@@ -101,14 +99,6 @@ class ResNet1D(nn.Module):
 # 3. Model Evaluation
 # ============================
 def evaluate_on_new_csv(csv_path, model_path, y_labels, device):
-    import torch
-    from torch.utils.data import DataLoader
-    import torch.nn.functional as F
-    from sklearn.preprocessing import LabelEncoder
-    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import pandas as pd
 
     # Load cleaned CSV
     df = pd.read_csv(csv_path, header=[0, 1])
@@ -183,11 +173,14 @@ def explain_with_lime(model, X_test, y_labels, feature_names, device, frame_inde
     explanation = explainer.explain_instance(
         data_row=X_test[frame_index],
         predict_fn=predict_fn_lime,
-        num_features=12,
+        num_features=20,       #output features
         top_labels=1
     )
-    # Return the explanation HTML (to embed in Streamlit)
-    return explanation.as_html(show_table=True)
+
+    # Generate clean HTML without scrollbars, with custom color replacements for clarity
+    lime_html = explanation.as_html(show_table=True)
+
+    return lime_html
 
 # ============================
 # 5. SHAP
@@ -217,8 +210,8 @@ def explain_with_shap(model, X_test, y_labels, feature_names, device, frame_inde
         feature_names=feature_names
     )
 
-    # Plot to a matplotlib figure and return it
-    fig = plt.figure(figsize=(10,6))
-    shap.plots.waterfall(explanation, max_display=20, show=False)
+    fig = plt.figure(figsize=(10, 6))
+    shap.plots.waterfall(explanation, max_display=10, show=False)    #output feature
     plt.tight_layout()
+
     return fig, pred_label, confidence
