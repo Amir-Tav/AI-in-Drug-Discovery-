@@ -93,7 +93,8 @@ if uploaded_file:
         st.markdown("---")
         st.subheader("Choose a Model")
         model_options = {
-            "ExpandedResNet1D (v2)": "models/v2/v2_model.pt"
+            "ExpandedResNet1D (v2)": "models/v2/v2_model.pt",
+            "Experimental model": "models/v2/resnet1d_final.pt"
         }
         model_choice = st.selectbox("Available Models", list(model_options.keys()))
         model_path = model_options[model_choice]
