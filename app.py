@@ -1,6 +1,3 @@
-# ========================
-# 🚀 Imports and Setup
-# ========================
 import streamlit as st
 import os
 import pandas as pd
@@ -14,8 +11,11 @@ from utils import (
     ExpandedResNet1D,
     preprocess_input_csv,
     evaluate_on_new_csv,
+    evaluate_with_minirocket,
     explain_with_lime,
-    explain_with_shap
+    explain_with_shap,
+    explain_minirocket_lime,     # NEW
+    explain_minirocket_shap      # NEW
 )
 
 # Setup Streamlit and paths
@@ -25,10 +25,6 @@ os.makedirs(test_save_dir, exist_ok=True)
 
 st.set_page_config(page_title="DAT Classifier", layout="centered")
 st.title("🧬 DAT Bond Type Classifier")
-
-# ========================
-# ⚙️ Caching for Performance
-# ========================
 
 @st.cache_resource(show_spinner=False)
 def get_lime_explainer(X_train, y_labels, feature_names):
@@ -53,7 +49,7 @@ def cached_predict_fn(_model_state_dict, input_channels, num_classes, device, in
         return F.softmax(outputs, dim=1).cpu().numpy()
 
 # ========================
-# 📂 File Upload and Cleaning
+# File Upload and Cleaning
 # ========================
 uploaded_file = st.file_uploader("📂 Upload a cleaned or raw CSV file", type=["csv"])
 
@@ -79,22 +75,22 @@ if uploaded_file:
     if cleaned_path is None and st.button("🧼 Clean Uploaded File"):
         cleaned_path = preprocess_input_csv(raw_path, test_save_dir)
         df = pd.read_csv(cleaned_path, header=[0, 1])
-        st.success("🧹 File cleaned and saved.")
+        st.success("🧺 File cleaned and saved.")
         st.write("Preview of cleaned data:", df.head())
 
-    # Track state
     if "results" not in st.session_state:
         st.session_state["results"] = None
 
     # ========================
-    # 🧠 Model Selection and Prediction
+    # Model Selection and Prediction
     # ========================
     if cleaned_path:
         st.markdown("---")
         st.subheader("Choose a Model")
         model_options = {
             "ExpandedResNet1D (v2)": "models/v2/v2_model.pt",
-            "Experimental model": "models/v2/resnet1d_final.pt"
+            "Experimental model": "models/v2/resnet1d_final.pt",
+            "MiniRocket + LogisticRegression": "models/v2/minirocket_logistic.joblib"
         }
         model_choice = st.selectbox("Available Models", list(model_options.keys()))
         model_path = model_options[model_choice]
@@ -108,23 +104,34 @@ if uploaded_file:
             else:
                 st.info("Predicting on uploaded data...")
 
-                results, _ = evaluate_on_new_csv(
-                    cleaned_path,
-                    model_path,
-                    y_labels,
-                    device,
-                    model_class=ExpandedResNet1D
-                )
+                if model_choice == "MiniRocket + LogisticRegression":
+                    rocket_path = "models/v2/minirocket_transformer.joblib"
+                    results = evaluate_with_minirocket(
+                        cleaned_path,
+                        rocket_path,
+                        model_path,
+                        y_labels
+                    )
+                else:
+                    results, _ = evaluate_on_new_csv(
+                        cleaned_path,
+                        model_path,
+                        y_labels,
+                        device,
+                        model_class=ExpandedResNet1D
+                    )
+
                 st.session_state.update({
                     "results": results,
                     "y_labels": y_labels,
                     "model_path": model_path,
-                    "cleaned_path": cleaned_path
+                    "cleaned_path": cleaned_path,
+                    "model_choice": model_choice
                 })
                 st.success("✅ Prediction Complete")
 
         # ========================
-        #  Display Predictions and Stats
+        # Display Predictions and Stats
         # ========================
         if st.session_state["results"] is not None:
             st.subheader("📊 Sample Predictions")
@@ -144,28 +151,40 @@ if uploaded_file:
                 st.write(f"{label}: {counts.get(label, 0)} frames")
 
             # ========================
-            #  Explanation Method Selection
+            # Explanation Method Selection
             # ========================
-            explanation_method = st.selectbox("🧪 Choose Explanation Method", options=["None", "LIME", "SHAP", "Aggregate LIME"])
+            if st.session_state["model_choice"] == "MiniRocket + LogisticRegression":
+                explanation_options = ["None", "LIME", "SHAP"]
+                aggregate_lime_available = False
+            else:
+                explanation_options = ["None", "LIME", "SHAP", "Aggregate LIME"]
+                aggregate_lime_available = True
+
+            explanation_method = st.selectbox("🧪 Choose Explanation Method", options=explanation_options)
             df = pd.read_csv(st.session_state["cleaned_path"], header=[0, 1])
             X_test = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
             feature_names = [f"{res}-{inter}" for res, inter in df.columns if res != "meta"]
 
-            if explanation_method in ["LIME", "SHAP"]:
-                frame_index = st.number_input("Select Frame Number for Explanation", 0, len(X_test)-1, 20)
+            frame_index = st.number_input("Select Frame Number for Explanation", 0, len(X_test)-1, 20)
 
-            # ========================
-            #  Single-Frame LIME Explanation
-            # ========================
             if explanation_method == "LIME":
                 st.info(f"Running LIME explanation for frame {frame_index}...")
 
-                model = ExpandedResNet1D(input_channels=1, num_classes=len(st.session_state["y_labels"]))
-                model.load_state_dict(torch.load(st.session_state["model_path"], map_location=device))
-                model.to(device)
-                model.eval()
+                if st.session_state["model_choice"] == "MiniRocket + LogisticRegression":
+                    import joblib
+                    from sktime.transformations.panel.rocket import MiniRocket
 
-                lime_html = explain_with_lime(model, X_test, st.session_state["y_labels"], feature_names, device, frame_index=frame_index)
+                    clf = joblib.load(st.session_state["model_path"])
+                    rocket = joblib.load("models/v2/minirocket_transformer.joblib")
+                    X_reshaped = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+                    X_tf = rocket.transform(X_reshaped)
+                    lime_html = explain_minirocket_lime(clf, X_tf, X_tf, st.session_state["y_labels"], frame_index)
+                else:
+                    model = ExpandedResNet1D(input_channels=1, num_classes=len(st.session_state["y_labels"]))
+                    model.load_state_dict(torch.load(st.session_state["model_path"], map_location=device))
+                    model.to(device)
+                    model.eval()
+                    lime_html = explain_with_lime(model, X_test, st.session_state["y_labels"], feature_names, device, frame_index)
 
                 wrapped_html = f"""
                 <div style="background-color: white; padding: 15px; border-radius: 8px;">
@@ -175,29 +194,34 @@ if uploaded_file:
                 """
                 components.html(wrapped_html, height=1000)
 
-            # ========================
-            #  Single-Frame SHAP Explanation
-            # ========================
             elif explanation_method == "SHAP":
                 st.info(f"Running SHAP explanation for frame {frame_index}...")
 
-                model = ExpandedResNet1D(input_channels=1, num_classes=len(st.session_state["y_labels"]))
-                model.load_state_dict(torch.load(st.session_state["model_path"], map_location=device))
-                model.to(device)
-                model.eval()
+                if st.session_state["model_choice"] == "MiniRocket + LogisticRegression":
+                    import joblib
+                    from sktime.transformations.panel.rocket import MiniRocket
 
-                fig, pred_label, confidence = explain_with_shap(
-                    model, X_test, st.session_state["y_labels"], feature_names, device, frame_index=frame_index
-                )
+                    clf = joblib.load(st.session_state["model_path"])
+                    rocket = joblib.load("models/v2/minirocket_transformer.joblib")
+                    X_reshaped = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+                    X_tf = rocket.transform(X_reshaped)
+                    fig, pred_label, confidence = explain_minirocket_shap(clf, X_tf, X_tf, st.session_state["y_labels"], frame_index)
+                else:
+                    model = ExpandedResNet1D(input_channels=1, num_classes=len(st.session_state["y_labels"]))
+                    model.load_state_dict(torch.load(st.session_state["model_path"], map_location=device))
+                    model.to(device)
+                    model.eval()
+                    fig, pred_label, confidence = explain_with_shap(model, X_test, st.session_state["y_labels"], feature_names, device, frame_index)
+
                 st.write(f"Frame {frame_index} Prediction: **{pred_label.upper()}** (Confidence: {confidence:.2f})")
                 st.pyplot(fig)
 
-            # ========================
-            #  Class-Specific Aggregate LIME Explanation
-            # ========================
             elif explanation_method == "Aggregate LIME":
-                st.info("Computing class-specific aggregate LIME explanation...")
+                if not aggregate_lime_available:
+                    st.warning("⚠️ Aggregate LIME is not supported for MiniRocket models.")
+                    st.stop()
 
+                st.info("Computing class-specific aggregate LIME explanation...")
                 selected_class = st.selectbox("Select Class for Aggregation", options=st.session_state["y_labels"])
                 num_frames = st.number_input("Number of Frames to Aggregate", 10, min(200, len(X_test)), 50, step=10)
 
@@ -213,7 +237,6 @@ if uploaded_file:
                     )
 
                 explainer = get_lime_explainer(X_test, st.session_state["y_labels"], feature_names)
-
                 importance, matched = {}, 0
                 for i in range(len(X_test)):
                     if matched >= num_frames:
@@ -236,8 +259,8 @@ if uploaded_file:
                     st.warning(f"No frames found with predicted class '{selected_class}'.")
                 else:
                     sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]
-                    import matplotlib.pyplot as plt
                     feat_names, weights = zip(*sorted_importance)
+                    import matplotlib.pyplot as plt
                     fig, ax = plt.subplots(figsize=(10, 5))
                     ax.barh(feat_names[::-1], weights[::-1], color='darkorange')
                     ax.set_xlabel(f"Aggregate LIME Importance for '{selected_class}'")

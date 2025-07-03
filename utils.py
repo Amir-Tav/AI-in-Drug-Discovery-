@@ -1,6 +1,7 @@
 import os
 import lime
 import torch
+import joblib
 import shap
 import pandas as pd
 import numpy as np
@@ -240,6 +241,111 @@ def explain_with_shap(model, X_test, y_labels, feature_names, device, frame_inde
 
     fig = plt.figure(figsize=(10, 6))
     shap.plots.waterfall(explanation, max_display=15, show=False)               #out display 
+    plt.tight_layout()
+
+    return fig, pred_label, confidence
+
+
+# ============================
+# 7. MiniRocket Evaluation
+# ============================
+def evaluate_with_minirocket(csv_path, rocket_path, clf_path, y_labels, output_dir="results"):
+    import pandas as pd
+    import os
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load transformer & model
+    rocket = joblib.load(rocket_path)
+    clf = joblib.load(clf_path)
+
+    # Load CSV (assumes cleaned format with multi-index)
+    df = pd.read_csv(csv_path, header=[0, 1])
+    X = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
+    
+    # Reshape for MiniRocket
+    X = X.reshape(X.shape[0], 1, X.shape[1])
+    
+    # Transform
+    X_tf = rocket.transform(X)
+    
+    # Predict
+    y_pred = clf.predict(X_tf)
+    y_pred_labels = [y_labels[i] for i in y_pred]
+
+    # Return results
+    result_df = pd.DataFrame({
+        "Frame": df[("meta", "frame")].values,
+        "Predicted": y_pred_labels
+    })
+    
+    out_path = os.path.join(output_dir, "minirocket_predictions.csv")
+    result_df.to_csv(out_path, index=False)
+    print(f"✅ Predictions saved to: {out_path}")
+    
+    return result_df
+
+# ============================
+# 8. LIME for MiniRocket + LogisticRegression
+# ============================
+def explain_minirocket_lime(clf, X_train_tf, X_test_tf, y_labels, frame_index=0):
+    from lime.lime_tabular import LimeTabularExplainer
+    import numpy as np
+
+    X_train_tf = np.array(X_train_tf)  # ensure proper ndarray
+    X_test_tf = np.array(X_test_tf)
+
+    explainer = LimeTabularExplainer(
+        training_data=X_train_tf,
+        feature_names=[f"F{i}" for i in range(X_train_tf.shape[1])],
+        class_names=y_labels.tolist(),
+        mode="classification",
+        discretize_continuous=True  # required for numerical data
+    )
+
+    explanation = explainer.explain_instance(
+        data_row=X_test_tf[frame_index],
+        predict_fn=clf.predict_proba,
+        num_features=15
+    )
+
+    return explanation.as_html(show_table=True)
+
+
+# ============================
+# 9. SHAP for MiniRocket + LogisticRegression
+# ============================
+def explain_minirocket_shap(clf, X_train_tf, X_test_tf, y_labels, frame_index=0):
+    import shap
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Convert to NumPy arrays
+    X_train_tf = np.array(X_train_tf)
+    X_test_tf = np.array(X_test_tf)
+
+    # Get predicted class for the frame
+    prediction = clf.predict_proba(X_test_tf[frame_index:frame_index+1])[0]
+    pred_class = np.argmax(prediction)
+    pred_label = y_labels[pred_class]
+    confidence = prediction[pred_class]
+
+    # Build the KernelExplainer
+    explainer = shap.Explainer(clf, X_train_tf)
+    shap_values = explainer(X_test_tf[frame_index:frame_index+1])  # shape: (1, features, classes)
+
+    # Extract the correct class explanation from the multi-output SHAP object
+
+    explanation = shap.Explanation(
+        values=shap_values.values[0][:, pred_class],
+        base_values=shap_values.base_values[0][pred_class],
+        data=shap_values.data[0],
+        feature_names=[f"f{i}" for i in range(X_test_tf.shape[1])]  # Optional: update with real feature names
+    )
+
+    # Plot
+    fig = plt.figure(figsize=(10, 6))
+    shap.plots.waterfall(explanation, max_display=15, show=False)
     plt.tight_layout()
 
     return fig, pred_label, confidence
