@@ -65,7 +65,7 @@ def cached_predict_fn(_model_state_dict, input_channels, num_classes, device, in
         return F.softmax(outputs, dim=1).cpu().numpy()
 
 def show_tanimoto_tab():
-    st.subheader("🔬 Tanimoto Comparison: Dual Dataset")
+    st.subheader("🔬 Tanimoto Comparison: Confidence Over Chunks")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -74,51 +74,65 @@ def show_tanimoto_tab():
         file_2 = st.file_uploader("📂 Dataset B", type=["csv"], key="tani_b")
 
     if file_1 and file_2:
-        def load_csv(uploaded_file):
+        def load_and_save(uploaded_file):
             path = os.path.join(tani_save_dir, uploaded_file.name)
             with open(path, "wb") as f:
                 f.write(uploaded_file.read())
+            return path
+
+        path1 = load_and_save(file_1)
+        path2 = load_and_save(file_2)
+
+        # Model selector
+        st.markdown("### ⚙️ Select Model")
+        model_options = {
+            "ExpandedResNet1D (v2)": "models/v2/v2_model.pt",
+            "Experimental model": "models/v2/resnet1d_final.pt",
+            "MiniRocket + LogisticRegression": "models/v2/minirocket_logistic.joblib",
+            "MiniRocket + MLP": "models/v3/Mini-RocketMLP.pt"
+        }
+        model_choice = st.selectbox("Available Models", list(model_options.keys()), key="tani_model")
+        model_path = model_options[model_choice]
+
+        if st.button("📊 Compare Chunked Confidence", key="run_tani_comparison"):
             try:
-                df = pd.read_csv(path, header=[0, 1])
-                if ("meta", "frame") not in df.columns:
-                    st.error(f"❌ Missing 'meta-frame' column in `{uploaded_file.name}`.")
-                    return None
-                return df
-            except Exception as e:
-                st.error(f"❌ Failed to read `{uploaded_file.name}`: {e}")
-                return None
+                y_labels = np.load("models/transfer/y_labels.npy", allow_pickle=True)
+            except FileNotFoundError:
+                st.error("❌ y_labels.npy not found in 'models/transfer'")
+                return
 
-        df1 = load_csv(file_1)
-        df2 = load_csv(file_2)
-
-        if df1 is not None and df2 is not None:
-            st.info("Running chunked confidence analysis on both datasets...")
+            # Run predictions independently
+            df1 = pd.read_csv(path1, header=[0, 1])
+            df2 = pd.read_csv(path2, header=[0, 1])
 
             conf1 = evaluate_chunked_confidence(
                 df=df1,
-                model_path=st.session_state["model_path"],
-                model_choice=st.session_state["model_choice"],
-                y_labels=st.session_state["y_labels"],
+                model_path=model_path,
+                model_choice=model_choice,
+                y_labels=y_labels,
                 device=device,
-                chunk_size=20           #20 frame 
+                chunk_size=50
             )
 
             conf2 = evaluate_chunked_confidence(
                 df=df2,
-                model_path=st.session_state["model_path"],
-                model_choice=st.session_state["model_choice"],
-                y_labels=st.session_state["y_labels"],
+                model_path=model_path,
+                model_choice=model_choice,
+                y_labels=y_labels,
                 device=device,
-                chunk_size=20           #20 frame 
+                chunk_size=50
             )
 
-            min_len = min(len(conf1), len(conf2))
-            x = list(range(1, min_len + 1))
-
+            # Plot both datasets fully
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(x, conf1[:min_len], marker='o', label=file_1.name, color='tab:blue')
-            ax.plot(x, conf2[:min_len], marker='s', label=file_2.name, color='tab:orange')
-            ax.set_xlabel("Chunk # (every 20 frames)")
+
+            x1 = list(range(1, len(conf1) + 1))
+            x2 = list(range(1, len(conf2) + 1))
+
+            ax.plot(x1, conf1, marker='o', label=os.path.basename(path1), color='tab:blue')
+            ax.plot(x2, conf2, marker='s', label=os.path.basename(path2), color='tab:orange')
+
+            ax.set_xlabel("Chunk # (every 50 frames)")
             ax.set_ylabel("Model Confidence")
             ax.set_title("Model Confidence Comparison")
             ax.set_ylim(0, 1)
@@ -290,7 +304,8 @@ if uploaded_file:
             model_options = {
                 "ExpandedResNet1D (v2)": "models/v2/v2_model.pt",
                 "Experimental model": "models/v2/resnet1d_final.pt",
-                "MiniRocket + LogisticRegression": "models/v2/minirocket_logistic.joblib"
+                "MiniRocket + LogisticRegression": "models/v2/minirocket_logistic.joblib",
+                "MiniRocket + MLP": "models/v3/Mini-RocketMLP.pt"
             }
             model_choice = st.selectbox("Available Models", list(model_options.keys()))
             model_path = model_options[model_choice]
@@ -300,11 +315,17 @@ if uploaded_file:
                     y_labels = np.load("models/transfer/y_labels.npy", allow_pickle=True)
                 except FileNotFoundError:
                     st.error("❌ y_labels.npy not found in 'models/transfer'")
-                else:
+                else:   
                     if model_choice == "MiniRocket + LogisticRegression":
-                        results = evaluate_with_minirocket(cleaned_path, "models/v2/minirocket_transformer.joblib", model_path, y_labels)
+                        results = evaluate_with_minirocket(
+                            cleaned_path, "models/v2/minirocket_transformer.joblib", model_path, y_labels)
+                    elif model_choice == "MiniRocket + MLP":
+                        from utils import evaluate_minirocket_mlp
+                        results = evaluate_minirocket_mlp(
+                            cleaned_path, "models/v3/minirocket_transformer.joblib", model_path, y_labels, device)
                     else:
-                        results, _ = evaluate_on_new_csv(cleaned_path, model_path, y_labels, device, model_class=ExpandedResNet1D)
+                        results, _ = evaluate_on_new_csv(
+                            cleaned_path, model_path, y_labels, device, model_class=ExpandedResNet1D)
 
                     st.session_state.update({
                         "results": results,

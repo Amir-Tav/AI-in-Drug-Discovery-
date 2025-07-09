@@ -246,6 +246,7 @@ def explain_with_shap(model, X_test, y_labels, feature_names, device, frame_inde
     return fig, pred_label, confidence
 
 
+#######################################         Mini ROcket + logistic           ################################################## 
 # ============================
 # 7. MiniRocket Evaluation
 # ============================
@@ -348,9 +349,67 @@ def explain_minirocket_shap(clf, X_train_tf, X_test_tf, y_labels, frame_index=0,
     return fig, pred_label, confidence
 
 
+###############################################       MiniRocket with MLP      ##############################################
+
+# ============================
+# MiniRocketMLP Model
+# ============================
+class MiniRocketMLP(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super(MiniRocketMLP, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.dropout1 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(128, 64)
+        self.dropout2 = nn.Dropout(0.3)
+        self.out = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        return self.out(x)
+
+# ============================
+#   Evaluation for MiniRocket + MLP
+# ============================
+def evaluate_minirocket_mlp(csv_path, rocket_path, model_path, y_labels, device):
+    # Load and prepare the CSV
+    df = pd.read_csv(csv_path, header=[0, 1])
+    X = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
+    X = X.reshape(X.shape[0], 1, X.shape[1])  # shape = (samples, 1, 87)
+
+    # Load MiniRocket transformer and transform
+    rocket = joblib.load(rocket_path)
+    X_tf = rocket.transform(X)
+    X_tf = np.asarray(X_tf)  # make sure it's a proper ndarray
+
+    # Load model
+    model = MiniRocketMLP(input_dim=X_tf.shape[1], num_classes=len(y_labels))
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Predict
+    with torch.no_grad():
+        X_tensor = torch.tensor(X_tf, dtype=torch.float32).to(device)
+        logits = model(X_tensor)
+        preds = torch.argmax(F.softmax(logits, dim=1), dim=1).cpu().numpy()
+
+    # Return predictions in a DataFrame
+    result_df = pd.DataFrame({
+        "Frame": df[("meta", "frame")].values,
+        "Predicted": [y_labels[i] for i in preds]
+    })
+
+    return result_df
+
+################################################        Tanimoto-Style      ###################################################
+
 # ============================
 # 10. Chunked Confidence Evaluation (Tanimoto-style)
 # ============================
+
 def evaluate_chunked_confidence(
     df: pd.DataFrame,
     model_path: str,
@@ -360,43 +419,73 @@ def evaluate_chunked_confidence(
     chunk_size: int = 20
 ):
     """
-    Evaluates model confidence across grouped frame chunks (e.g., every 20 frames).
-
-    Returns:
-        List of average max-confidence values per chunk.
+    Evaluates model confidence across grouped frame chunks
+    by averaging per-frame class probabilities, then taking
+    max class confidence per chunk.
     """
     X = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
+    num_classes = len(y_labels)
     num_chunks = len(X) // chunk_size
     confidences = []
 
+    # Frame-wise prediction
     if model_choice == "MiniRocket + LogisticRegression":
         from sktime.transformations.panel.rocket import MiniRocket
-        import joblib
-
         rocket = joblib.load("models/v2/minirocket_transformer.joblib")
         clf = joblib.load(model_path)
 
-        for i in range(num_chunks):
-            chunk = X[i * chunk_size:(i + 1) * chunk_size]
-            chunk = chunk.reshape(chunk.shape[0], 1, chunk.shape[1])
-            transformed = rocket.transform(chunk)
-            probs = clf.predict_proba(transformed)
-            avg_max = np.max(np.mean(probs, axis=0))  # mean of probs across chunk, then max class
-            confidences.append(avg_max)
+        X_reshaped = X.reshape(X.shape[0], 1, X.shape[1])
+        X_tf = rocket.transform(X_reshaped)
 
-    else:
-        model = ExpandedResNet1D(input_channels=1, num_classes=len(y_labels))
+        # Convert sparse to dense if needed
+        if hasattr(X_tf, "toarray"):
+            X_tf = X_tf.toarray()
+        X_tf = np.asarray(X_tf, dtype=np.float32)
+
+        probs_all = clf.predict_proba(X_tf)
+
+    elif model_choice == "MiniRocket + MLP":
+        rocket = joblib.load("models/v3/minirocket_transformer.joblib")
+        X_reshaped = X.reshape(X.shape[0], 1, X.shape[1])
+        X_tf = rocket.transform(X_reshaped)
+
+        # Convert sparse to dense and ensure dtype
+        if hasattr(X_tf, "toarray"):
+            X_tf = X_tf.toarray()
+        X_tf = np.asarray(X_tf, dtype=np.float32)
+
+        # Load correct input dimension used during training
+        try:
+            input_dim = int(np.load("models/v3/minirocket_input_dim.npy")[0])
+        except FileNotFoundError:
+            raise RuntimeError("❌ Missing 'minirocket_input_dim.npy'. Please save input_dim during training.")
+
+        model = MiniRocketMLP(input_dim=input_dim, num_classes=num_classes)
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
         model.eval()
 
-        for i in range(num_chunks):
-            chunk = X[i * chunk_size:(i + 1) * chunk_size]
-            tensor = torch.tensor(chunk[:, np.newaxis, :], dtype=torch.float32).to(device)
-            with torch.no_grad():
-                outputs = model(tensor)
-                probs = F.softmax(outputs, dim=1).cpu().numpy()
-            avg_max = np.max(np.mean(probs, axis=0))
-            confidences.append(avg_max)
+        with torch.no_grad():
+            X_tensor = torch.tensor(X_tf, dtype=torch.float32).to(device)
+            probs_all = F.softmax(model(X_tensor), dim=1).cpu().numpy()
+
+    else:
+        model = ExpandedResNet1D(input_channels=1, num_classes=num_classes)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        with torch.no_grad():
+            X_tensor = torch.tensor(X[:, np.newaxis, :], dtype=torch.float32).to(device)
+            outputs = model(X_tensor)
+            probs_all = F.softmax(outputs, dim=1).cpu().numpy()
+
+    # Aggregate by chunk
+    for i in range(num_chunks):
+        chunk_probs = probs_all[i * chunk_size:(i + 1) * chunk_size]
+        mean_probs = np.mean(chunk_probs, axis=0)
+        max_prob = np.max(mean_probs)
+        confidences.append(max_prob)
 
     return confidences
+
