@@ -3,6 +3,7 @@ import lime
 import torch
 import joblib
 import shap
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import torch.nn as nn
@@ -369,6 +370,58 @@ class MiniRocketMLP(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.dropout2(x)
         return self.out(x)
+    
+
+class MiniRocketMLP_V2(nn.Module):
+    """Fold‑5 MLP: two Linear layers + Dropout, no BatchNorm."""
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.dropout1 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(128, 64)
+        self.dropout2 = nn.Dropout(0.3)
+        self.out = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        return self.out(x)
+
+
+# Fold‑5 MiniRocket + MLP‑V2 evaluator
+def evaluate_minirocket_mlp_v2(csv_path, rocket_path, model_path, y_labels, device):
+    """
+    Inference pipeline for the BatchNorm + SiLU MLP trained in fold‑5.
+    """
+    # 1. Load and reshape CSV --------------------------------------------------
+    df = pd.read_csv(csv_path, header=[0, 1])
+    X  = df.loc[:, df.columns.get_level_values(0) != "meta"] \
+            .to_numpy(dtype=np.float32)
+    X  = X.reshape(X.shape[0], 1, X.shape[1])  # (samples, 1, 87)
+
+    # 2. Transform with fold‑5 MiniRocket -------------------------------------
+    rocket = joblib.load(rocket_path)
+    X_tf   = np.asarray(rocket.transform(X), dtype=np.float32)
+
+    # 3. Load fold‑5 MLP‑V2 weights -------------------------------------------
+    model = MiniRocketMLP_V2(input_dim=X_tf.shape[1],
+                             num_classes=len(y_labels))
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device).eval()
+
+    # 4. Predict --------------------------------------------------------------
+    with torch.no_grad():
+        logits = model(torch.tensor(X_tf).to(device))
+        preds  = torch.argmax(F.softmax(logits, dim=1), dim=1).cpu().numpy()
+
+    # 5. Return as DataFrame ---------------------------------------------------
+    return pd.DataFrame({
+        "Frame": df[("meta", "frame")].values,
+        "Predicted": [y_labels[i] for i in preds]
+    })
+
 
 # ============================
 #   Evaluation for MiniRocket + MLP
@@ -419,73 +472,180 @@ def evaluate_chunked_confidence(
     chunk_size: int = 20
 ):
     """
-    Evaluates model confidence across grouped frame chunks
-    by averaging per-frame class probabilities, then taking
-    max class confidence per chunk.
+    Aggregates class probabilities over successive frame chunks
+    and returns the max‑class confidence per chunk.
     """
-    X = df.loc[:, df.columns.get_level_values(0) != "meta"].to_numpy(dtype=np.float32)
+    X = df.loc[:, df.columns.get_level_values(0) != "meta"] \
+          .to_numpy(dtype=np.float32)
     num_classes = len(y_labels)
-    num_chunks = len(X) // chunk_size
+    num_chunks  = len(X) // chunk_size
     confidences = []
+    win_classes = [] 
 
-    # Frame-wise prediction
+    # ------------------------------------------------------------------
+    # Model‑specific frame‑wise probabilities
+    # ------------------------------------------------------------------
     if model_choice == "MiniRocket + LogisticRegression":
-        from sktime.transformations.panel.rocket import MiniRocket
         rocket = joblib.load("models/v2/minirocket_transformer.joblib")
-        clf = joblib.load(model_path)
-
-        X_reshaped = X.reshape(X.shape[0], 1, X.shape[1])
-        X_tf = rocket.transform(X_reshaped)
-
-        # Convert sparse to dense if needed
-        if hasattr(X_tf, "toarray"):
-            X_tf = X_tf.toarray()
-        X_tf = np.asarray(X_tf, dtype=np.float32)
-
-        probs_all = clf.predict_proba(X_tf)
+        clf    = joblib.load(model_path)
+        X_tf   = rocket.transform(X.reshape(X.shape[0], 1, X.shape[1]))
+        X_tf   = X_tf.toarray() if hasattr(X_tf, "toarray") else X_tf
+        probs_all = clf.predict_proba(np.asarray(X_tf, dtype=np.float32))
 
     elif model_choice == "MiniRocket + MLP":
         rocket = joblib.load("models/v3/minirocket_transformer.joblib")
-        X_reshaped = X.reshape(X.shape[0], 1, X.shape[1])
-        X_tf = rocket.transform(X_reshaped)
-
-        # Convert sparse to dense and ensure dtype
-        if hasattr(X_tf, "toarray"):
-            X_tf = X_tf.toarray()
-        X_tf = np.asarray(X_tf, dtype=np.float32)
-
-        # Load correct input dimension used during training
-        try:
-            input_dim = int(np.load("models/v3/minirocket_input_dim.npy")[0])
-        except FileNotFoundError:
-            raise RuntimeError("❌ Missing 'minirocket_input_dim.npy'. Please save input_dim during training.")
-
+        X_tf   = rocket.transform(X.reshape(X.shape[0], 1, X.shape[1]))
+        X_tf   = X_tf.toarray() if hasattr(X_tf, "toarray") else X_tf
+        X_tf   = np.asarray(X_tf, dtype=np.float32)
+        input_dim = int(np.load("models/v3/minirocket_input_dim.npy")[0])
         model = MiniRocketMLP(input_dim=input_dim, num_classes=num_classes)
         model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval()
-
+        model.to(device).eval()
         with torch.no_grad():
-            X_tensor = torch.tensor(X_tf, dtype=torch.float32).to(device)
-            probs_all = F.softmax(model(X_tensor), dim=1).cpu().numpy()
+            probs_all = F.softmax(model(torch.tensor(X_tf).to(device)), dim=1).cpu().numpy()
 
-    else:
+    elif model_choice == "MiniRocketMLP_V2 (fold‑5)":
+        # -------- New branch: MiniRocketMLP_V2 + fold‑5 transformer ----------
+        rocket = joblib.load("models/v4/rocket_fold5.joblib")
+        X_tf   = rocket.transform(X.reshape(X.shape[0], 1, X.shape[1]))
+        X_tf   = X_tf.toarray() if hasattr(X_tf, "toarray") else X_tf
+        X_tf   = np.asarray(X_tf, dtype=np.float32)
+        model = MiniRocketMLP_V2(input_dim=X_tf.shape[1], num_classes=num_classes)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device).eval()
+        with torch.no_grad():
+            probs_all = F.softmax(model(torch.tensor(X_tf).to(device)), dim=1).cpu().numpy()
+
+    else:  # ExpandedResNet1D or other CNN baselines
         model = ExpandedResNet1D(input_channels=1, num_classes=num_classes)
         model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval()
-
+        model.to(device).eval()
         with torch.no_grad():
-            X_tensor = torch.tensor(X[:, np.newaxis, :], dtype=torch.float32).to(device)
-            outputs = model(X_tensor)
+            outputs = model(torch.tensor(X[:, np.newaxis, :], dtype=torch.float32).to(device))
             probs_all = F.softmax(outputs, dim=1).cpu().numpy()
 
-    # Aggregate by chunk
+    # ------------------------------------------------------------------
+    # Aggregate per‑chunk
+    # ------------------------------------------------------------------
     for i in range(num_chunks):
         chunk_probs = probs_all[i * chunk_size:(i + 1) * chunk_size]
-        mean_probs = np.mean(chunk_probs, axis=0)
-        max_prob = np.max(mean_probs)
-        confidences.append(max_prob)
+        mean_probs  = np.mean(chunk_probs, axis=0)
+        confidences.append(np.max(mean_probs))
+        win_classes.append(int(np.argmax(mean_probs))) 
 
-    return confidences
+    return confidences, win_classes 
 
+
+#### getting model confidence as a CSV 
+
+def chunk_confidence_to_df(confidences, winners, chunk_size):
+
+    """
+    Build a DataFrame with one row per chunk.
+
+    Columns
+    -------
+    chunk_id      : 1‑based chunk index
+    start_frame   : first frame number in the chunk (0‑based)
+    end_frame     : last frame number in the chunk  (inclusive)
+    max_conf      : highest averaged class probability in the chunk
+    winner_class  : class index of that max_conf
+    """
+    rows = []
+    for idx, (conf, win) in enumerate(zip(confidences, winners), start=1):
+        start = (idx - 1) * chunk_size
+        end   = start + chunk_size - 1
+        rows.append({
+            "chunk_id": idx,
+            "start_frame": start,
+            "end_frame": end,
+            "max_conf": conf,
+            "winner_class": win,
+        })
+    return pd.DataFrame(rows)
+
+
+####################### mini rocket MLP V5
+def _load_v5_artefacts(device="cpu"):
+    """
+    Internal helper to load the v5 MiniRocket transformer, MLP weights,
+    input dimension, and label classes. Caches objects on first call.
+    """
+    cache = _load_v5_artefacts.__dict__          # simple function‑level cache
+    if "rocket" not in cache:
+        base = Path("models/v5")
+        cache["rocket"]     = joblib.load(base / "minirocket_transformer.pkl")
+        input_dim           = int(np.load(base / "minirocket_input_dim.npy")[0])
+        cache["input_dim"]  = input_dim
+        cache["label_vals"] = np.load(base / "label_encoder_classes.npy",
+                              allow_pickle=True)
+        # build the same architecture used in training
+        from torch import nn
+        class RocketMLP(nn.Module):
+            def __init__(self, in_dim, n_classes):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(in_dim, 512),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(512, 256),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(256, n_classes)
+                )
+            def forward(self, x):
+                return self.net(x)
+        model = RocketMLP(in_dim=input_dim, n_classes=len(cache["label_vals"]))
+        model.load_state_dict(torch.load(base / "rocket_mlp_weights.pt",
+                                         map_location=device))
+        model.to(device).eval()
+        cache["model"] = model
+    return cache["rocket"], cache["model"], cache["label_vals"], cache["input_dim"]
+
+def evaluate_minirocket_mlp_v5(csv_path, device="cpu"):
+    """
+    Predict `bond_type` for a cleaned fingerprint CSV using the v5
+    MiniRocket + MLP model.
+
+    Returns
+    -------
+    preds        : ndarray of string labels
+    probs        : ndarray of soft‑probabilities, shape (N, 3)
+    acc (or None): accuracy if ground‑truth column is present
+    """
+    import pandas as pd
+    rocket, model, label_vals, _ = _load_v5_artefacts(device)
+
+    # ── 1. Load CSV ─────────────────────────────────────────────────────────
+    df = pd.read_csv(csv_path)
+
+    # Drop pseudo‑header row if still present
+    if df.loc[0, df.columns[-2]] == "bond_type":
+        df = df.iloc[1:].reset_index(drop=True)
+
+    # ── 2. Select numeric fingerprint columns only ──────────────────────────
+    # Any non‑numeric column (frame_idx, bond_type, drug_name, etc.) is auto‑excluded
+    num_cols = df.select_dtypes(include=["number"]).columns
+    fp_cols  = [c for c in num_cols if c not in ("frame_idx",)]
+    X = df[fp_cols].to_numpy(dtype=np.float32)[..., None]          # (N, C, 1)
+
+    # Pad to 9 time‑points to satisfy MiniRocketMultivariate
+    X = np.pad(X, ((0, 0), (0, 0), (0, 8)), mode="constant")
+
+    # ── 3. Transform with fitted MiniRocket ────────────────────────────────
+    X_tf = rocket.transform(X)
+    X_tf = np.asarray(X_tf, dtype=np.float32)
+
+    # ── 4. Predict with cached MLP -----------------------------------------
+    with torch.no_grad():
+        logits = model(torch.tensor(X_tf, device=device))
+        probs  = F.softmax(logits, dim=1).cpu().numpy()
+    preds = label_vals[probs.argmax(1)]
+
+    # ── 5. Optional accuracy if ground truth available ---------------------
+    acc = None
+    if "bond_type" in df.columns:
+        y_true = df["bond_type"].values
+        acc    = accuracy_score(y_true, preds)
+
+    return preds, probs, acc
