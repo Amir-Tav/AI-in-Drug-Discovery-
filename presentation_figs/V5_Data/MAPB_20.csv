@@ -1,0 +1,11 @@
+chunk_id,start_frame,end_frame,max_conf,winner_class,true_class,pred_class
+1,0,19,0.6447708010673523,0,inward,inward
+2,20,39,0.7735393643379211,0,inward,inward
+3,40,59,0.7068044543266296,0,inward,inward
+4,60,79,0.7033572793006897,0,inward,inward
+5,80,99,0.8008861541748047,0,inward,inward
+6,100,119,0.6699930429458618,0,inward,inward
+7,120,139,0.7588671445846558,0,inward,inward
+8,140,159,0.6774938702583313,0,inward,inward
+9,160,179,0.750001072883606,0,inward,inward
+10,180,187,0.6434887051582336,0,inward,inward

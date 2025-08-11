@@ -649,3 +649,4 @@ def evaluate_minirocket_mlp_v5(csv_path, device="cpu"):
         acc    = accuracy_score(y_true, preds)
 
     return preds, probs, acc
+
